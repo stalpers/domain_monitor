@@ -1,0 +1,48 @@
+# domain-monitor rules
+#
+# Copy to rules.yaml and edit. This file is configuration, not secrets -- keep it in
+# version control so rule changes show up as readable diffs. Credentials live in .env.
+#
+# Every rule needs a name, a description and a regex, because every alert quotes all
+# three. An alert that cannot explain why it fired is noise.
+#
+# Event types (zone-scoped on purpose -- leaving the zone is NOT the same as becoming
+# available to register):
+#
+#   ADDED_TO_ZONE      - a name that is now delegated and was not known before
+#   REMOVED_FROM_ZONE  - a name that was delegated and is no longer
+#   RETURNED_TO_ZONE   - a name that came back after being absent
+#
+# Regexes are matched against the normalised name: lowercase, punycode. An umlaut domain
+# reaches your pattern as xn--... , so match on the punycode form if you need it.
+
+rules:
+  - name: "Brand impersonation"
+    description: "Domain resembling the Example corporate brand, including digit substitutions"
+    regex: '(?i)examp[l1]e'
+    events: [ADDED_TO_ZONE]
+    enabled: true
+
+  - name: "Authentication keywords"
+    description: "Potential phishing domain containing authentication terminology"
+    regex: '(?i)(login|signin|verify|account|passwort|konto)'
+    events: [ADDED_TO_ZONE]
+    enabled: true
+
+  - name: "Short .ch domains released"
+    description: "Three-letter .ch domain that left the zone and may become registrable"
+    regex: '^[a-z]{3}\.ch$'
+    events: [REMOVED_FROM_ZONE]
+    enabled: true
+
+  - name: "Punycode registrations"
+    description: "Newly delegated internationalised domain, often used for homograph attacks"
+    regex: '^xn--'
+    events: [ADDED_TO_ZONE]
+    enabled: false
+
+  - name: "Flapping domains"
+    description: "Domain that returned to the zone after being absent"
+    regex: '.'
+    events: [RETURNED_TO_ZONE]
+    enabled: false
