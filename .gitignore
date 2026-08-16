@@ -1,0 +1,18 @@
+# Secrets and local configuration
+.env
+rules.yaml
+
+# Database and runtime state
+data/
+*.db
+*.db-journal
+*.db-wal
+*.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
