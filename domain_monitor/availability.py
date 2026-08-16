@@ -13,8 +13,9 @@ When a concrete checker arrives it should run only on domains that already matte
 ``REMOVED_FROM_ZONE`` event that matched a rule -- rather than on every disappearance, and
 it must be rate limited against the registry.
 
-A working RDAP checker for `.ch`/`.li` exists elsewhere in this repository
-(``src/wiederfrei/rdap.py``), verified against the live registry: ``HEAD`` on
+A working RDAP checker for `.ch`/`.li` already exists in a sibling project,
+``stalpers/check_wiederfrei`` (``src/wiederfrei/rdap.py``), verified against the
+live registry: ``HEAD`` on
 ``rdap.nic.ch/domain/<name>`` returns 200 for registered and 404 for available, and the
 response *body* is redacted for anonymous callers -- ``events`` is empty and
 ``nameservers`` is empty even for a delegated domain -- so only the status code carries

@@ -275,7 +275,8 @@ the event names exist to prevent. When one is added it should run only on domain
 already matter — a `REMOVED_FROM_ZONE` event that matched a rule — rather than on every
 disappearance, and be rate limited against the registry.
 
-A working RDAP checker for `.ch`/`.li` exists elsewhere in this repository
+A working RDAP checker for `.ch`/`.li` already exists in a sibling project,
+[stalpers/check_wiederfrei](https://github.com/stalpers/check_wiederfrei)
 (`src/wiederfrei/rdap.py`), verified against the live registry: `HEAD` on
 `rdap.nic.ch/domain/<name>` returns `200` for registered and `404` for available, and the
 response **body is redacted** for anonymous callers — `events` and `nameservers` come back
