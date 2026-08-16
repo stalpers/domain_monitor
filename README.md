@@ -190,9 +190,12 @@ That limit is enforced in code, not just documented: a run inside the window reu
 state and exits `SKIPPED` rather than re-transferring. Running cron more often is therefore
 harmless, just pointless. A non-round minute avoids contention with jobs scheduled on the hour.
 
-Concurrent runs are prevented by a file lock (`LOCK_PATH`). A second invocation exits
-quietly rather than queueing — a queued run would just re-transfer a zone the running
-instance is already transferring.
+Concurrent runs are prevented by a file lock (`LOCK_PATH`, defaulting to the system temp
+directory). A second invocation exits quietly rather than queueing — a queued run would
+just re-transfer a zone the running instance is already transferring.
+
+Runs on Windows as well as POSIX — the lock uses `msvcrt.locking` there instead of
+`fcntl.flock`, same non-blocking-acquire contract either way (`domain_monitor/locking.py`).
 
 ## Safety: a failed transfer is not a mass deletion
 

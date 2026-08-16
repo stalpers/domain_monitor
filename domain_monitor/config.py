@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -405,7 +406,10 @@ def load_config(env_file: Path | str | None = ".env", env: dict[str, str] | None
         smtp=smtp,
         console_alerts=_env_bool("CONSOLE_ALERTS", True, env),
         log_level=env.get("LOG_LEVEL", "INFO"),
-        lock_path=Path(env.get("LOCK_PATH", "/tmp/domain-monitor.lock")),
+        lock_path=Path(
+            env.get("LOCK_PATH")
+            or str(Path(tempfile.gettempdir()) / "domain-monitor.lock")
+        ),
         min_transfer_interval_hours=int(env.get("ZONE_MIN_TRANSFER_INTERVAL_HOURS") or 24),
         min_zone_ratio=ratio,
     )

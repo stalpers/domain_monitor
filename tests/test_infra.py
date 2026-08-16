@@ -90,6 +90,83 @@ class TestLocking:
             pass
         assert (tmp_path / "nested" / "dir").exists()
 
+    def test_pid_is_recorded_and_not_left_stale_after_a_shorter_write(self, tmp_path):
+        """The file is truncated after each write, so a later run with a shorter pid
+        cannot leave trailing bytes from a previous, longer one."""
+        path = tmp_path / "lock"
+        with process_lock(path):
+            first = path.read_bytes()
+        assert first == str(__import__("os").getpid()).encode("ascii")
+
+
+class TestWindowsLocking:
+    """domain-monitor is meant to run unattended via cron/Task Scheduler on either OS.
+
+    A real Windows machine isn't available in CI, but the platform branch can still be
+    exercised on POSIX by swapping in a fake ``msvcrt`` and flipping the module's
+    platform flag -- this is a regression test for the historical bug (`import fcntl`
+    at module load time, unconditionally) that made the module unimportable on Windows
+    before any of this logic ever ran, and it proves the seek/lock/write/unlock
+    sequencing is self-consistent for the msvcrt code path.
+    """
+
+    class FakeMsvcrt:
+        LK_NBLCK = 1
+        LK_UNLCK = 0
+
+        def __init__(self):
+            self.locked_by = None
+
+        def locking(self, fd, mode, nbytes):
+            assert nbytes == 1
+            if mode == self.LK_NBLCK:
+                if self.locked_by is not None and self.locked_by != fd:
+                    raise OSError("Permission denied (fake msvcrt)")
+                self.locked_by = fd
+            elif mode == self.LK_UNLCK:
+                if self.locked_by == fd:
+                    self.locked_by = None
+
+    @pytest.fixture()
+    def windows(self, monkeypatch):
+        import domain_monitor.locking as locking_module
+
+        fake = self.FakeMsvcrt()
+        monkeypatch.setattr(locking_module, "WINDOWS", True)
+        monkeypatch.setattr(locking_module, "msvcrt", fake, raising=False)
+        return fake
+
+    def test_acquire_and_release_on_the_windows_path(self, windows, tmp_path):
+        path = tmp_path / "lock"
+        with process_lock(path):
+            assert windows.locked_by is not None
+        assert windows.locked_by is None
+
+    def test_second_acquire_is_refused_on_the_windows_path(self, windows, tmp_path):
+        path = tmp_path / "lock"
+        with process_lock(path), pytest.raises(AlreadyRunning):
+            with process_lock(path):
+                pass
+
+    def test_pid_is_written_and_readable_back_on_the_windows_path(self, windows, tmp_path):
+        import os
+
+        path = tmp_path / "lock"
+        with process_lock(path):
+            pass
+        assert path.read_bytes() == str(os.getpid()).encode("ascii")
+
+    def test_module_still_imports_when_msvcrt_is_the_only_option(self):
+        """The bug this whole class guards against: locking.py used to `import fcntl`
+        unconditionally at module scope, which raised ModuleNotFoundError on Windows
+        before process_lock() was ever called -- `domain-monitor init` couldn't even
+        start. This just confirms the module that's actually imported project-wide
+        exposes both code paths rather than hard-failing at import time."""
+        import domain_monitor.locking as locking_module
+
+        assert hasattr(locking_module, "_acquire")
+        assert hasattr(locking_module, "_release")
+
 
 class TestTransferInterval:
     def test_no_previous_transfer(self, session):
@@ -168,6 +245,33 @@ class TestConfigLoading:
             load_config(env={
                 **self.BASE, "DOMAIN_RULES_PATH": str(rules), "ZONE_MIN_RATIO": "1.5",
             })
+
+    def test_default_lock_path_uses_the_system_temp_dir(self, tmp_path):
+        """Must resolve per-OS (system temp dir on Windows, /tmp on POSIX) rather than
+        a hardcoded POSIX path -- an unset LOCK_PATH used to default to the literal
+        string "/tmp/domain-monitor.lock" everywhere, including Windows."""
+        import tempfile
+        from pathlib import Path
+
+        rules = tmp_path / "rules.yaml"
+        rules.write_text(
+            "rules:\n  - name: N\n    description: d\n    regex: 'x'\n    events: [ADDED_TO_ZONE]\n",
+            encoding="utf-8",
+        )
+        cfg = load_config(env={**self.BASE, "DOMAIN_RULES_PATH": str(rules)})
+        assert cfg.lock_path.parent == Path(tempfile.gettempdir())
+
+    def test_lock_path_override_is_respected(self, tmp_path):
+        rules = tmp_path / "rules.yaml"
+        rules.write_text(
+            "rules:\n  - name: N\n    description: d\n    regex: 'x'\n    events: [ADDED_TO_ZONE]\n",
+            encoding="utf-8",
+        )
+        custom = tmp_path / "custom.lock"
+        cfg = load_config(env={
+            **self.BASE, "DOMAIN_RULES_PATH": str(rules), "LOCK_PATH": str(custom),
+        })
+        assert cfg.lock_path == custom
 
     def test_shipped_example_rules_are_valid(self):
         """rules.example.yaml is what users copy; it must load."""
