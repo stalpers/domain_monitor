@@ -31,6 +31,7 @@ from .alerts import AlertError, console_alert, send_email, send_failure_email
 from .config import Config
 from .diff import DiffCounts, apply_diff
 from .models import Alert, Run, utcnow
+from .ngram import NgramModel, load_model
 from .rules import Match, backfill, evaluate_events
 from .zones import (
     ZoneError,
@@ -125,7 +126,10 @@ def run_once(
 
         matches: list[Match] = []
         if not counts.baseline:
-            matches = evaluate_events(session, run.id, counts.event_ids, cfg.enabled_rules())
+            models = _load_models(session, transferred_tlds)
+            matches = evaluate_events(
+                session, run.id, counts.event_ids, cfg.enabled_rules(), models
+            )
         report.matches = matches
 
         for result in results:
@@ -197,7 +201,8 @@ def run_backfill(
     report = RunReport(run_id=run.id, status=Run.STATUS_RUNNING)
 
     try:
-        matches = backfill(session, run.id, cfg.enabled_rules(), only=only)
+        models = _load_models(session, cfg.tlds)
+        matches = backfill(session, run.id, cfg.enabled_rules(), only=only, models=models)
         report.matches = matches
         run.matched_count = len(matches)
         run.status = Run.STATUS_SUCCESS
@@ -258,6 +263,21 @@ def _deliver(
             record.sent_at = utcnow()
 
     session.commit()
+
+
+def _load_models(session: Session, tlds: list[str]) -> dict[str, NgramModel]:
+    """Load each TLD's trained n-gram model, if one exists.
+
+    Missing is not an error -- lexical scoring degrades gracefully with no model (see
+    ``lexical.randomness_score``) rather than blocking a run on ``model build`` having
+    been run first.
+    """
+    models: dict[str, NgramModel] = {}
+    for tld in tlds:
+        model = load_model(session, tld)
+        if model is not None:
+            models[tld] = model
+    return models
 
 
 def recent_runs(session: Session, limit: int = 10) -> list[Run]:

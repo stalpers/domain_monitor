@@ -61,6 +61,106 @@ An alert that cannot explain why it fired is noise. Patterns are matched against
 domain-monitor rules          # list rules and validate every regex
 ```
 
+## Malicious-name detection
+
+A second rule type, `type: typosquat`, checks each name against a curated brand watchlist
+for homoglyphs, typos, keyboard-adjacent substitutions, bit-flips, combosquats and
+hyphenation:
+
+```yaml
+rules:
+  - name: "Brand watchlist"
+    description: "Typosquat, homoglyph or combosquat of a protected brand"
+    type: typosquat
+    brands: [example, postfinance, migros]
+    max_distance: 1
+    events: [ADDED_TO_ZONE, RETURNED_TO_ZONE]
+```
+
+### Why this is a watchlist, not a classifier
+
+Every method-level model in the literature this was built against — n-gram/entropy
+features, a Transformer+CNN reporting 95.8% accuracy — is evaluated on a **balanced**
+benchmark. A real zone is not balanced. At roughly 1,000 new `.ch` delegations a day and a
+generous ~1% actually malicious, a 95.8%-accurate classifier (~4% false-positive rate)
+produces about 40 false alerts for every 10 true ones — **~20% precision**, worse at a
+more realistic 0.1% base rate. A classifier that looks excellent in a paper produces an
+unreadable alert stream against a real namespace.
+
+So precision, not accuracy, is what this is built around, in order of how specific (and
+therefore how precise) each technique is:
+
+1. **Homoglyph skeleton matching** — confusable characters (`0→o`, `rn→m`, Cyrillic
+   `а→a`, …) are folded to a canonical form, so a squat becomes an exact-match lookup
+   instead of a distance computation. Catches `examp1e`, `exarnple`, and Cyrillic
+   homographs (`ехаmple`) in one mechanism, including when the pipeline has already
+   normalised the name to punycode — the check decodes back to Unicode first.
+2. **Bit-flip matching** — a single-bit error in one character, precomputed per brand
+   into a lookup set. Exploits memory/transmission errors rather than perception, so
+   unlike the other methods the variant can look nothing like the brand.
+3. **Combosquat** — the brand touching a hyphen or a credential/payment-specific keyword
+   (`login`, `verify`, `account`, …). Deliberately **not** a bare substring match: a
+   watchlist entry for `coop` must not fire on `cooperative.ch`. Generic business
+   vocabulary (`service`, `support`, `portal`) was tried in testing and dropped — it
+   collides with ordinary Swiss company naming often enough to defeat the point of the
+   gate.
+4. **Bounded edit-distance and keyboard-adjacency** — omission, insertion, transposition,
+   repetition, replacement, and (checked against **QWERTZ** — the Swiss layout — as well
+   as QWERTY and AZERTY) single-key slips.
+
+**Short brands need a different bar.** `ubs`, `sbb`, `coop`, `ptt` — common for Swiss
+institutions — sit at edit-distance 1 from ordinary words (`ubs`/`usb`/`ups`/`pubs`), and
+a bare hyphen next to them is nearly meaningless (`chicken-coop.ch`). Brands shorter than
+`min_length_for_distance` (default 5) skip edit-distance, keyboard and bare-hyphen
+matching entirely; they still get homoglyph, bit-flip, and keyword-gated combosquat,
+which stay precise regardless of length. This was found empirically, not designed in
+advance — `tests/test_typosquat.py::TestFalsePositiveCorpus` is the regression test for
+it, checked against ~50 plausible Swiss business names with a **zero-match** bar.
+
+**Lexical/randomness scoring never fires an alert on its own.** Every match is enriched
+with a 0–1 "how DGA-like is this" score (entropy, consonant runs, vowel ratio, and — once
+trained — likelihood against an n-gram model of the zone itself), shown in every alert for
+triage, and used to order results by score. But `Assessment.fires` in `scoring.py` is
+defined purely in terms of watchlist signals: a maximally random-looking name with no
+watchlist hit produces no alert, ever. This is the enforcement point for the whole
+precision argument above, and it's covered end-to-end in
+`tests/test_security_rules.py::TestPostureEndToEnd`, not just unit-tested in isolation.
+
+### The n-gram baseline is trained on your own zone
+
+`domain-monitor model build` trains a character-trigram model from the domains **already
+in your zone**, rather than a generic "benign domains" list. It needs no download, it
+matches the actual population being scored (Swiss naming conventions, the DE/FR/IT mix),
+and at millions of names it dwarfs any public benign-domain dataset — malicious names are
+far too rare to meaningfully bias what "normal" looks like.
+
+```bash
+domain-monitor model build           # train from the current zone, all monitored TLDs
+domain-monitor model show            # inspect what's trained
+```
+
+Run this once you have a real zone; scoring degrades gracefully with no model (a 0.5,
+"neutral", likelihood) rather than blocking on it.
+
+### Tools
+
+```bash
+domain-monitor analyse examp1e.ch                    # full signal breakdown for one name
+domain-monitor analyse suspicious --brands acme,corp  # against an ad-hoc list, no config needed
+domain-monitor run --export-features out.csv          # feature CSV for every event this run saw
+```
+
+`analyse` is the "why did/didn't this fire" tool — use it to tune a watchlist before
+deploying it, and to see exactly what a rule would have done to a name without waiting
+for it to actually appear in the zone.
+
+`--export-features` writes a lexical-feature row (length, entropy, digit/vowel ratios,
+consonant runs, IDN flag) plus a weak `watchlist_fired` label for **every** event a run
+evaluates, not only the ones that matched. This is deliberately the seam for a future
+classifier: rather than build one now against data nobody has, this grows a labelled
+dataset from your own traffic that a model could later be trained on — see the module
+docstring in `scoring.py` for why a classifier isn't in scope yet.
+
 ## Use
 
 ```bash
@@ -73,6 +173,9 @@ domain-monitor run --force-transfer   # ignore the 24h interval
 domain-monitor rules --backfill       # evaluate rules against every in-zone domain
 domain-monitor status                 # counts, last transfers, recent runs
 domain-monitor test-email
+
+domain-monitor analyse <name>         # score one name; see "Malicious-name detection"
+domain-monitor model build            # train the n-gram baseline from the zone
 ```
 
 ### Cron
@@ -120,6 +223,11 @@ Domain -> DomainEvent -> RuleMatch -> Alert
 
 Events are immutable facts. `Domain.currently_in_zone` is a convenience projection of the
 latest event, not the source of truth.
+
+`RuleMatch` rows carry `method` and `brand` (null for a plain regex match) plus `score`
+and a JSON `signals` breakdown for typosquat hits — one row per **method** that fired, so
+a name matching both `homoglyph` and `combosquat` against the same brand produces two
+attributed rows, not one row that has to explain two things at once.
 
 That asymmetry is why this project carries Alembic migrations rather than just recreating
 the schema: **the `domains` table is disposable** — one zone transfer rebuilds it — but the
@@ -194,9 +302,13 @@ unrestricted egress — so the pipeline is tested through injected zone contents
 file source (`CH_ZONE_FILE`), and the AXFR path is unit-tested separately. **The first real
 transfer should be run manually with `--dry-run` first.**
 
-`tests/test_safety.py` is the file to read first: it is the mass-removal regression suite,
-covering transfer failure, empty zone and plausible-but-partial zone, each asserting zero
-state change.
+Two files to read first, for the two properties this project is actually built around:
+
+- `tests/test_safety.py` — the mass-removal regression suite. Transfer failure, empty
+  zone, plausible-but-partial zone, each asserting zero state change.
+- `tests/test_typosquat.py::TestFalsePositiveCorpus` — the precision regression suite.
+  A curated brand list checked against ~50 plausible benign Swiss domain names, zero
+  matches required.
 
 Migrations:
 

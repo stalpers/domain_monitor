@@ -99,6 +99,15 @@ class RuleMatch(Base):
     matched_value: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+    #: The following four are populated only by typosquat rules; a regex match leaves
+    #: them null. ``method`` and ``brand`` are what let an alert say *which technique*
+    #: and *which brand* fired, rather than just "the rule matched". ``score`` and
+    #: ``signals`` (a JSON breakdown) come from scoring.py and drive alert ordering.
+    method: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    brand: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    signals: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     domain: Mapped[Domain] = relationship()
     event: Mapped[DomainEvent | None] = relationship(back_populates="matches")
 
@@ -188,3 +197,20 @@ class ZoneSnapshotStat(Base):
     name_count: Mapped[int] = mapped_column(Integer, nullable=False)
     transferred_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class NgramModelRecord(Base):
+    """A trained character n-gram model (``ngram.NgramModel``), one per TLD.
+
+    Stored as an opaque JSON payload rather than normalised counts: the model is only
+    ever read back whole (``ngram.load_model``), and a trigram table over a multi-million
+    name zone is tens of thousands of entries, well within a JSON column.
+    """
+
+    __tablename__ = "ngram_models"
+
+    tld: Mapped[str] = mapped_column(String(63), primary_key=True)
+    order: Mapped[int] = mapped_column(Integer, nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    trained_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

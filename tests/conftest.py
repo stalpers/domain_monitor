@@ -7,7 +7,7 @@ from domain_monitor.config import (
     REMOVED_FROM_ZONE,
     RETURNED_TO_ZONE,
     Config,
-    DomainRule,
+    RegexRule,
     SmtpConfig,
     ZoneSource,
 )
@@ -16,7 +16,7 @@ from domain_monitor.database import create_all, create_db_engine, make_session_f
 
 def rule(name="Test rule", pattern=".", events=(ADDED_TO_ZONE,), enabled=True,
          description="a rule used in tests"):
-    return DomainRule(
+    return RegexRule(
         name=name,
         description=description,
         regex=re.compile(pattern),

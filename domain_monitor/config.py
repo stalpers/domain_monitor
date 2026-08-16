@@ -46,7 +46,21 @@ FUTURE_EVENT_TYPES = frozenset({"AVAILABLE", "REGISTERED_NOT_DELEGATED", "UNKNOW
 
 
 @dataclass(frozen=True, slots=True)
-class DomainRule:
+class RuleHit:
+    """One thing a rule found for one label. A regex rule produces at most one of these
+    per name; a typosquat rule can produce several -- one per method that fired, since a
+    single name can be simultaneously a homoglyph *and* an edit-distance match, and each
+    is worth its own attributed alert line."""
+
+    matched_value: str
+    method: str | None = None       # e.g. "homoglyph", "combosquat"; None for a plain regex
+    brand: str | None = None
+    score: float | None = None
+    signals: str | None = None      # JSON signal breakdown, for typosquat hits
+
+
+@dataclass(frozen=True, slots=True)
+class RegexRule:
     name: str
     description: str
     regex: re.Pattern[str]
@@ -58,8 +72,82 @@ class DomainRule:
         found = self.regex.search(name)
         return found.group(0) if found is not None else None
 
+    def assess(self, name: str, *, tld: str | None = None, model: object = None) -> list[RuleHit]:
+        # ``model`` is accepted-and-ignored so callers can invoke every rule type
+        # uniformly without an isinstance check; only TypoRule consults it.
+        matched = self.matches(name)
+        return [RuleHit(matched_value=matched)] if matched is not None else []
+
     def applies_to(self, event_type: str) -> bool:
         return event_type in self.event_types
+
+    @property
+    def pattern_summary(self) -> str:
+        return self.regex.pattern
+
+
+@dataclass(slots=True)
+class TypoRule:
+    """A rule backed by a brand :class:`~domain_monitor.typosquat.Watchlist`.
+
+    ``model`` is looked up per-TLD from the database at evaluation time (see
+    ``rules.py``), not stored on the rule itself -- the rule is config, loaded once at
+    startup, while the n-gram model is trained data that can be rebuilt independently via
+    ``domain-monitor model build``.
+    """
+
+    name: str
+    description: str
+    watchlist: object            # typosquat.Watchlist; typed loosely to avoid an import cycle
+    event_types: frozenset[str]
+    enabled: bool = True
+
+    def assess(self, name: str, *, tld: str | None = None, model: object = None) -> list[RuleHit]:
+        from . import scoring
+
+        label = name.rsplit(".", 1)[0] if "." in name else name
+        result = scoring.assess(label, self.watchlist, model, tld=tld)
+        if not result.fires:
+            return []
+
+        import json
+
+        hits: list[RuleHit] = []
+        for sig in result.watchlist_signals:
+            payload = {
+                "method": sig.name, "brand": sig.brand, "distance": sig.distance,
+                "detail": sig.detail,
+                "lexical": result.features.as_dict() if result.features else {},
+                "lexical_signals": [
+                    {"name": s.name, "weight": s.weight, "detail": s.detail}
+                    for s in result.lexical_signals
+                ],
+            }
+            hits.append(RuleHit(
+                matched_value=label, method=sig.name, brand=sig.brand,
+                score=round(sig.weight + scoring.LEXICAL_WEIGHT * sum(
+                    s.weight for s in result.lexical_signals
+                ), 4),
+                signals=json.dumps(payload),
+            ))
+        return hits
+
+    def applies_to(self, event_type: str) -> bool:
+        return event_type in self.event_types
+
+    @property
+    def pattern_summary(self) -> str:
+        wl = self.watchlist
+        return (
+            f"typosquat: {len(wl.brands)} brand(s), max_distance={wl.max_distance}, "
+            f"methods={sorted(wl.methods)}"
+        )
+
+
+#: A configured rule is one or the other. Both expose ``.name``, ``.description``,
+#: ``.event_types``, ``.enabled``, ``.applies_to()`` and ``.assess()``, so callers in
+#: ``rules.py`` need no isinstance dispatch.
+DomainRule = RegexRule | TypoRule
 
 
 @dataclass(slots=True)
@@ -150,28 +238,7 @@ def load_rules(path: Path | str) -> list[DomainRule]:
     return rules
 
 
-def _build_rule(entry: Any, path: Path) -> DomainRule:
-    if not isinstance(entry, dict):
-        raise ConfigError(f"each entry under 'rules' in {path} must be a mapping")
-
-    name = str(entry.get("name", "")).strip()
-    if not name:
-        raise ConfigError(f"a rule in {path} has no 'name'; alerts are attributed by it")
-
-    description = str(entry.get("description", "")).strip()
-    if not description:
-        raise ConfigError(
-            f"rule {name!r} has no 'description'; every alert must explain why it fired"
-        )
-
-    pattern = entry.get("regex")
-    if not pattern:
-        raise ConfigError(f"rule {name!r} has no 'regex'")
-    try:
-        compiled = re.compile(str(pattern))
-    except re.error as exc:
-        raise ConfigError(f"rule {name!r} has an invalid regex {pattern!r}: {exc}") from None
-
+def _parse_events(entry: dict[str, Any], name: str) -> frozenset[str]:
     events = entry.get("events", [])
     if isinstance(events, str):
         events = [events]
@@ -186,13 +253,100 @@ def _build_rule(entry: Any, path: Path) -> DomainRule:
             f"rule {name!r} references unknown event type(s) {sorted(unknown)}; "
             f"expected some of {sorted(EVENT_TYPES)}"
         )
+    return frozenset(events)
 
-    return DomainRule(
-        name=name,
-        description=description,
-        regex=compiled,
-        event_types=frozenset(events),
-        enabled=bool(entry.get("enabled", True)),
+
+def _build_rule(entry: Any, path: Path) -> DomainRule:
+    if not isinstance(entry, dict):
+        raise ConfigError(f"each entry under 'rules' in {path} must be a mapping")
+
+    name = str(entry.get("name", "")).strip()
+    if not name:
+        raise ConfigError(f"a rule in {path} has no 'name'; alerts are attributed by it")
+
+    description = str(entry.get("description", "")).strip()
+    if not description:
+        raise ConfigError(
+            f"rule {name!r} has no 'description'; every alert must explain why it fired"
+        )
+
+    rule_type = str(entry.get("type", "regex")).strip().lower()
+    enabled = bool(entry.get("enabled", True))
+    events = _parse_events(entry, name)
+
+    if rule_type == "regex":
+        return _build_regex_rule(entry, name, description, events, enabled)
+    if rule_type == "typosquat":
+        return _build_typo_rule(entry, name, description, events, enabled, path)
+    raise ConfigError(
+        f"rule {name!r} has unknown type {rule_type!r}; expected 'regex' or 'typosquat'"
+    )
+
+
+def _build_regex_rule(
+    entry: dict[str, Any], name: str, description: str, events: frozenset[str], enabled: bool
+) -> RegexRule:
+    pattern = entry.get("regex")
+    if not pattern:
+        raise ConfigError(f"rule {name!r} has no 'regex'")
+    try:
+        compiled = re.compile(str(pattern))
+    except re.error as exc:
+        raise ConfigError(f"rule {name!r} has an invalid regex {pattern!r}: {exc}") from None
+
+    return RegexRule(
+        name=name, description=description, regex=compiled,
+        event_types=events, enabled=enabled,
+    )
+
+
+def _build_typo_rule(
+    entry: dict[str, Any], name: str, description: str, events: frozenset[str],
+    enabled: bool, path: Path,
+) -> TypoRule:
+    from .typosquat import DEFAULT_METHODS, Watchlist
+
+    brands = entry.get("brands", [])
+    if isinstance(brands, str):
+        brands = [brands]
+    brands = [str(b).strip() for b in brands if str(b).strip()]
+    if not brands:
+        raise ConfigError(f"rule {name!r} (type: typosquat) has no 'brands'")
+
+    max_distance = int(entry.get("max_distance", 1))
+    if max_distance < 1:
+        raise ConfigError(f"rule {name!r}: max_distance must be at least 1")
+
+    methods_raw = entry.get("methods")
+    if methods_raw is None:
+        methods = frozenset(DEFAULT_METHODS)
+    else:
+        if isinstance(methods_raw, str):
+            methods_raw = [methods_raw]
+        methods = frozenset(str(m).strip().lower() for m in methods_raw)
+        known = DEFAULT_METHODS | {"tld_variant"}
+        unknown = methods - known
+        if unknown:
+            raise ConfigError(
+                f"rule {name!r}: unknown method(s) {sorted(unknown)}; expected some of "
+                f"{sorted(known)}"
+            )
+
+    layouts_raw = entry.get("keyboard_layouts", ["qwertz", "qwerty", "azerty"])
+    if isinstance(layouts_raw, str):
+        layouts_raw = [layouts_raw]
+    keyboard_layouts = tuple(str(layout_name).strip().lower() for layout_name in layouts_raw)
+
+    min_length = int(entry.get("min_length_for_distance", 5))
+
+    watchlist = Watchlist(
+        brands=brands, max_distance=max_distance, methods=methods,
+        keyboard_layouts=keyboard_layouts, min_length_for_distance=min_length,
+    )
+
+    return TypoRule(
+        name=name, description=description, watchlist=watchlist,
+        event_types=events, enabled=enabled,
     )
 
 

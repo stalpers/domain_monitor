@@ -49,6 +49,25 @@ def group_by_rule(matches: list[Match]) -> dict[str, list[Match]]:
     return dict(grouped)
 
 
+def group_by_brand(matches: list[Match]) -> dict[str, list[Match]]:
+    """Matches that carry a ``brand`` (typosquat hits), grouped by the brand impersonated.
+
+    A domain can appear more than once here if several methods fired for it -- that
+    repetition is informative, not noise: "this name matched three different techniques
+    against the same brand" is a stronger signal than any one of them alone.
+    """
+    grouped: dict[str, list[Match]] = defaultdict(list)
+    for match in matches:
+        if match.brand:
+            grouped[match.brand].append(match)
+    return dict(grouped)
+
+
+def _sort_key(match: Match) -> tuple[float, str]:
+    """Highest score first within a group; ties broken alphabetically for stable output."""
+    return (-(match.score or 0.0), match.domain_name)
+
+
 def subject_for(matches: list[Match]) -> str:
     rules = {m.rule_name for m in matches}
     if len(matches) == 1:
@@ -60,8 +79,20 @@ def subject_for(matches: list[Match]) -> str:
     return f"[DOMAIN ALERT] {len(matches)} rule matches across {len(rules)} rules"
 
 
+def _match_line(match: Match, timezone: str) -> str:
+    """One line for a match, with method/brand/score when this is a typosquat hit --
+    a bare "the rule matched" is not an explanation, and every alert must be one."""
+    event = match.event_type or "CURRENT (backfill)"
+    base = f"  {match.display_name:<40} {event:<20} {_localise(match.detected_at, timezone)}"
+    if match.method:
+        score = f"{match.score:.2f}" if match.score is not None else "-"
+        return base + f"\n      via {match.method} (brand={match.brand!r}, score={score})"
+    return base
+
+
 def render_text(matches: list[Match], run_id: int, timezone: str) -> str:
-    """Plain-text body, grouped by rule. Shared by both channels."""
+    """Plain-text body, grouped by rule and sorted by score within each group.
+    Shared by both channels."""
     lines = [
         f"{len(matches)} rule match(es) detected.",
         f"Run ID: {run_id}",
@@ -74,12 +105,21 @@ def render_text(matches: list[Match], run_id: int, timezone: str) -> str:
         lines.append(f"Pattern: {group[0].rule_pattern}")
         lines.append(f"Matches: {len(group)}")
         lines.append("")
-        for match in sorted(group, key=lambda m: m.domain_name):
-            event = match.event_type or "CURRENT (backfill)"
-            lines.append(
-                f"  {match.display_name:<40} {event:<20} "
-                f"{_localise(match.detected_at, timezone)}"
-            )
+        for match in sorted(group, key=_sort_key):
+            lines.append(_match_line(match, timezone))
+        lines.append("")
+
+    by_brand = group_by_brand(matches)
+    if by_brand:
+        lines.append("=" * 68)
+        lines.append("Summary by impersonated brand:")
+        lines.append("")
+        for brand, group in sorted(by_brand.items(), key=lambda kv: -len(kv[1])):
+            methods = sorted({m.method for m in group if m.method})
+            domains = sorted({m.display_name for m in group})
+            lines.append(f"  {brand!r}: {len(domains)} domain(s), methods={methods}")
+            for d in domains:
+                lines.append(f"    - {d}")
         lines.append("")
 
     lines.append("=" * 68)
@@ -92,14 +132,18 @@ def render_text(matches: list[Match], run_id: int, timezone: str) -> str:
 
 def console_alert(matches: list[Match], run_id: int, timezone: str) -> None:
     """Log each match individually; a terminal can take the detail."""
-    for match in matches:
+    for match in sorted(matches, key=_sort_key):
         logger.warning(
-            "MATCH %s | event=%s | rule=%s | pattern=%s | matched=%s | detected=%s | run=%d",
+            "MATCH %s | event=%s | rule=%s | pattern=%s | matched=%s"
+            " | method=%s | brand=%s | score=%s | detected=%s | run=%d",
             match.display_name,
             match.event_type or "CURRENT",
             match.rule_name,
             match.rule_pattern,
             match.matched_value,
+            match.method or "-",
+            match.brand or "-",
+            f"{match.score:.2f}" if match.score is not None else "-",
             _localise(match.detected_at, timezone),
             run_id,
         )

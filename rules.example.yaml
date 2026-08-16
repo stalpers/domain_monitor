@@ -3,8 +3,9 @@
 # Copy to rules.yaml and edit. This file is configuration, not secrets -- keep it in
 # version control so rule changes show up as readable diffs. Credentials live in .env.
 #
-# Every rule needs a name, a description and a regex, because every alert quotes all
-# three. An alert that cannot explain why it fired is noise.
+# Every rule needs a name, a description and either 'regex' or 'brands' (depending on
+# type), because every alert quotes all of it. An alert that cannot explain why it fired
+# is noise.
 #
 # Event types (zone-scoped on purpose -- leaving the zone is NOT the same as becoming
 # available to register):
@@ -13,16 +14,42 @@
 #   REMOVED_FROM_ZONE  - a name that was delegated and is no longer
 #   RETURNED_TO_ZONE   - a name that came back after being absent
 #
+# Two rule types:
+#
+#   type: regex      (the default -- 'type:' can be omitted)
+#   type: typosquat   brand-watchlist detection: homoglyphs, bounded-edit-distance typos,
+#                      keyboard-adjacent substitutions, bit-flips, combosquats and
+#                      hyphenation against a curated list of brand names.
+#
 # Regexes are matched against the normalised name: lowercase, punycode. An umlaut domain
 # reaches your pattern as xn--... , so match on the punycode form if you need it.
+# Typosquat rules decode punycode back to Unicode internally before comparing, so brands
+# should be given in their plain, human form ("zürich", not "xn--zrich-kva").
 
 rules:
-  - name: "Brand impersonation"
-    description: "Domain resembling the Example corporate brand, including digit substitutions"
-    regex: '(?i)examp[l1]e'
-    events: [ADDED_TO_ZONE]
+  # --- typosquat: the precise, low-false-positive detector -----------------------
+  #
+  # Only this rule type is capable of alerting on its own; a name's lexical
+  # "randomness" (how DGA-like it looks) is always shown as enrichment on a match, never
+  # used to decide whether one fires -- see the README's "Malicious name detection"
+  # section for why. Zero false positives against a corpus of ~50 plausible Swiss
+  # business names is the bar this rule type is held to; see tests/test_typosquat.py.
+  - name: "Brand watchlist"
+    description: >-
+      Typosquat, homoglyph, keyboard-typo, bit-flip or combosquat of a protected brand
+    type: typosquat
+    brands: [example, postfinance, migros, coop, sbb, raiffeisen]
+    max_distance: 1              # edit-distance bound for the 'typo' method
+    # methods: [homoglyph, bitsquat, combosquat, hyphenation, keyboard, typo]  # default: all
+    # keyboard_layouts: [qwertz, qwerty, azerty]   # qwertz first: Switzerland's own layout
+    # min_length_for_distance: 5  # brands shorter than this skip typo/keyboard/bare-hyphen
+    #                              # matching -- "ubs" is edit-distance 1 from "usb"/"ups";
+    #                              # short brands still get homoglyph, bitsquat, and
+    #                              # keyword-gated combosquat, which stay precise regardless
+    events: [ADDED_TO_ZONE, RETURNED_TO_ZONE]
     enabled: true
 
+  # --- regex: broader nets, complementary to the watchlist above -----------------
   - name: "Authentication keywords"
     description: "Potential phishing domain containing authentication terminology"
     regex: '(?i)(login|signin|verify|account|passwort|konto)'
