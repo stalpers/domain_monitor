@@ -39,6 +39,18 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 10_000
 
+#: RR types that terminate the scan for a given owner without it being a delegation. Real
+#: zone dumps interleave DNSSEC records (RRSIG/NSEC/NSEC3/DS) and the apex's own A/AAAA/SOA
+#: with the NS lines; none of these are ever a delegation for a *different* owner name.
+_STOP_RDATA_TYPES = frozenset({
+    "SOA", "A", "AAAA", "DS", "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM",
+    "TXT", "MX", "CNAME", "PTR", "CAA", "TLSA", "SRV", "NAPTR",
+})
+
+#: RFC 1035 wire-format limit on a full domain name. Applied as a last line of defence
+#: right before staging -- see :func:`_looks_like_domain_name`.
+_MAX_NAME_LENGTH = 253
+
 
 class ZoneError(Exception):
     """The zone could not be obtained, or the result failed validation."""
@@ -88,19 +100,72 @@ def _iter_axfr_names(source: ZoneSource, timeout: float, lifetime: float) -> Ite
 
 
 def _iter_file_names(path: Path, tld: str) -> Iterator[str]:
-    """Yield names from a one-per-line file.
+    """Yield names from a file: either one name per line, or a real BIND zone file.
 
     Exists so the pipeline is testable and operable without a TSIG key -- the AXFR path
-    cannot be exercised in CI or in a restricted network.
+    cannot be exercised in CI or in a restricted network. The format is detected per
+    line rather than declared up front, because the same ``*_ZONE_FILE`` setting has to
+    serve two things people naturally point it at: the simple format documented in
+    ``.env.example``, and a raw zone dump (``dig axfr`` output, or a file someone obtained
+    from Switch directly) -- which is full presentation-format RR lines (owner, TTL,
+    class, type, rdata), not one name per line.
+
+    A line with a single whitespace-separated token is a bare name -- no valid RR line is
+    that short. Anything else is treated as a zone-file RR line: only its ``NS`` owner is
+    extracted, mirroring what :func:`_iter_axfr_names` does for a live transfer, including
+    continuation lines (leading whitespace reuses the previous owner) and skipping the
+    zone apex's own NS RRset, which is the zone's nameservers rather than a delegation.
+    Anything that is not ``NS`` (SOA/A/AAAA/DS/RRSIG/NSEC/...) is skipped for that owner.
+
+    This is the fix for a real incident: without it, every field of every RR line --
+    including RRSIG/NSEC rdata -- was yielded verbatim as a "name". SQLite has no VARCHAR
+    length limit and stored the garbage silently; PostgreSQL does enforce it and raised
+    ``StringDataRightTruncation`` after 9.25M rows had already been staged.
     """
     if not path.exists():
         raise ZoneError(f".{tld}: zone file {path} not found")
+
+    apex_labels = {"@", tld, f"{tld}."}
+    last_owner = ""
     with open(path, encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith(("#", ";")):
+        for raw_line in handle:
+            line = raw_line.split(";", 1)[0].rstrip("\r\n")
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", "$")):
                 continue
-            yield line
+
+            fields = stripped.split()
+            if len(fields) == 1:
+                yield fields[0]                        # bare name, one per line
+                continue
+
+            if line[:1].isspace():
+                owner, rest = last_owner, fields        # continuation reuses the owner
+            else:
+                owner, rest = fields[0], fields[1:]
+                last_owner = owner
+            if not owner:
+                continue
+
+            for token in rest:
+                upper = token.upper()
+                if upper == "NS":
+                    if owner.lower() not in apex_labels:
+                        yield owner[:-1] if owner.endswith(".") else f"{owner}.{tld}"
+                    break
+                if upper in _STOP_RDATA_TYPES:
+                    break
+
+
+def _looks_like_domain_name(name: str) -> bool:
+    """Last line of defence before a name reaches ``zone_staging``.
+
+    Independent of where the name came from or which parser produced it, and independent
+    of the database backend -- SQLite enforces no VARCHAR length, so a future parsing bug
+    would corrupt ``zone_staging`` there in total silence, exactly as this one did until
+    it happened to hit a length-enforcing PostgreSQL column.
+    """
+    return bool(name) and len(name) <= _MAX_NAME_LENGTH and not any(c.isspace() for c in name)
 
 
 def stage_zone(
@@ -130,11 +195,20 @@ def stage_zone(
     seen_in_batch: set[str] = set()
     batch: list[dict] = []
     total = 0
+    skipped_malformed = 0
 
     try:
         for raw in stream:
             name = normalise_name(raw)
             if not name or name in seen_in_batch:
+                continue
+            if not _looks_like_domain_name(name):
+                skipped_malformed += 1
+                if skipped_malformed <= 10:
+                    logger.warning(
+                        ".%s: skipping malformed entry, not a plausible domain name: %r",
+                        source.tld, name[:80],
+                    )
                 continue
             seen_in_batch.add(name)
             batch.append({"run_id": run_id, "name": name, "tld": source.tld})
@@ -156,6 +230,12 @@ def stage_zone(
     if batch:
         session.bulk_insert_mappings(ZoneStaging, batch)
         total += len(batch)
+
+    if skipped_malformed:
+        logger.warning(
+            ".%s: skipped %d malformed entr%s that did not look like domain names",
+            source.tld, skipped_malformed, "y" if skipped_malformed == 1 else "ies",
+        )
 
     duration = time.monotonic() - started
     logger.info(".%s: staged %d delegated names in %.1fs", source.tld, total, duration)

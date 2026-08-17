@@ -306,10 +306,15 @@ unrestricted egress — so the pipeline is tested through injected zone contents
 file source (`CH_ZONE_FILE`), and the AXFR path is unit-tested separately. **The first real
 transfer should be run manually with `--dry-run` first.**
 
-Two files to read first, for the two properties this project is actually built around:
+Three files to read first, for the properties this project is actually built around:
 
 - `tests/test_safety.py` — the mass-removal regression suite. Transfer failure, empty
   zone, plausible-but-partial zone, each asserting zero state change.
+- `tests/test_zones.py` — the zone-file parsing regression suite. `*_ZONE_FILE` accepts
+  either a plain one-name-per-line list or a real BIND zone dump (auto-detected per
+  line); only `NS` owners are ever staged as names, and a last-line-of-defence check
+  rejects anything that doesn't look like a domain name before it reaches the database,
+  regardless of backend.
 - `tests/test_typosquat.py::TestFalsePositiveCorpus` — the precision regression suite.
   A curated brand list checked against ~50 plausible benign Swiss domain names, zero
   matches required.
