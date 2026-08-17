@@ -29,6 +29,8 @@ import dns.rdatatype
 import dns.tsigkeyring
 import dns.zone
 from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from .config import ZoneSource
@@ -168,6 +170,36 @@ def _looks_like_domain_name(name: str) -> bool:
     return bool(name) and len(name) <= _MAX_NAME_LENGTH and not any(c.isspace() for c in name)
 
 
+def _upsert_batch(session: Session, batch: list[dict]) -> None:
+    """Insert a batch, silently ignoring rows that duplicate ``(run_id, name)``.
+
+    Per-batch in-memory dedup (``seen_in_batch`` in :func:`stage_zone`) only catches a
+    repeat while it is still in the *current* batch. A name can legitimately repeat
+    further apart than that -- e.g. a domain's two ``NS`` records straddling exactly a
+    10,000-row batch flush -- and the fix is not to hold the whole run's names in memory
+    to catch it; that reintroduces the multi-million-name working set that staging
+    through the database in batches was built to avoid. The unique constraint on
+    ``zone_staging`` is the actual source of truth, so a conflicting row is simply not
+    inserted a second time, on either supported backend.
+    """
+    dialect = session.get_bind().dialect.name
+    table = ZoneStaging.__table__
+    if dialect == "postgresql":
+        session.execute(
+            pg_insert(table).values(batch).on_conflict_do_nothing(
+                index_elements=["run_id", "name"]
+            )
+        )
+    elif dialect == "sqlite":
+        session.execute(
+            sqlite_insert(table).values(batch).on_conflict_do_nothing(
+                index_elements=["run_id", "name"]
+            )
+        )
+    else:  # pragma: no cover - only sqlite/postgresql are supported backends
+        session.bulk_insert_mappings(ZoneStaging, batch)
+
+
 def stage_zone(
     session: Session,
     run_id: int,
@@ -194,7 +226,7 @@ def stage_zone(
 
     seen_in_batch: set[str] = set()
     batch: list[dict] = []
-    total = 0
+    offered = 0
     skipped_malformed = 0
 
     try:
@@ -213,28 +245,38 @@ def stage_zone(
             seen_in_batch.add(name)
             batch.append({"run_id": run_id, "name": name, "tld": source.tld})
             if len(batch) >= BATCH_SIZE:
-                session.bulk_insert_mappings(ZoneStaging, batch)
-                total += len(batch)
+                _upsert_batch(session, batch)
+                offered += len(batch)
                 batch.clear()
                 seen_in_batch.clear()
-                logger.debug(".%s: staged %d names", source.tld, total)
+                logger.debug(".%s: staged %d names", source.tld, offered)
     except ZoneError:
         raise
     except Exception as exc:
         # A transfer that dies part-way must be reported as incomplete, never silently
         # treated as "the zone is smaller today".
         complete = False
-        logger.error(".%s: zone transfer failed after %d names: %s", source.tld, total, exc)
+        logger.error(".%s: zone transfer failed after %d names: %s", source.tld, offered, exc)
         raise ZoneError(f".{source.tld}: zone transfer failed: {exc}") from exc
 
     if batch:
-        session.bulk_insert_mappings(ZoneStaging, batch)
-        total += len(batch)
+        _upsert_batch(session, batch)
+        offered += len(batch)
 
     if skipped_malformed:
         logger.warning(
             ".%s: skipped %d malformed entr%s that did not look like domain names",
             source.tld, skipped_malformed, "y" if skipped_malformed == 1 else "ies",
+        )
+
+    # `offered` counts rows sent for insertion, not rows that landed -- see
+    # _upsert_batch. The unique constraint is authoritative, so ask the table what
+    # actually staged rather than trust the offered count as the zone's size.
+    total = staged_count(session, run_id, source.tld)
+    if total != offered:
+        logger.info(
+            ".%s: %d name(s) offered, %d distinct after de-duplication",
+            source.tld, offered, total,
         )
 
     duration = time.monotonic() - started

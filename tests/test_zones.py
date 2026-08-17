@@ -143,3 +143,30 @@ class TestStageZoneWithARealZoneFile:
         bad = "nfc24.ch.\t\t3600\tin\tns\tns1.torn.sui-inter.net"
         result = stage_zone(session, run_id=1, source=source, names=["good.ch", bad])
         assert result.name_count == 1
+
+
+class TestDuplicateNamesAcrossBatches:
+    """Real zone data legitimately repeats an owner name -- most commonly a domain with
+    two NS records, which yields the same name twice. Production hit this exact case: a
+    name landing on both sides of a 10,000-row batch flush isn't caught by the per-batch
+    in-memory dedup (which is cleared on every flush, deliberately, to avoid holding a
+    multi-million-name set in memory), so the second copy collided with the unique
+    constraint on (run_id, name) and crashed the whole transfer with a UniqueViolation.
+    The fix upserts each batch, silently not re-inserting a conflicting row, on either
+    backend."""
+
+    def test_a_name_repeated_across_a_batch_boundary_does_not_crash(
+        self, session, monkeypatch
+    ):
+        import domain_monitor.zones as zones_module
+
+        monkeypatch.setattr(zones_module, "BATCH_SIZE", 2)
+        source = ZoneSource(tld="ch")
+        # "dup.ch" is the last name before a flush, then the first name after it --
+        # exactly the boundary-straddling case that crashed in production.
+        names = ["a.ch", "dup.ch", "dup.ch", "b.ch"]
+
+        result = stage_zone(session, run_id=1, source=source, names=names)
+
+        assert result.complete is True
+        assert result.name_count == 3  # a.ch, dup.ch, b.ch -- deduplicated
