@@ -364,6 +364,29 @@ alembic upgrade head
 alembic revision --autogenerate -m "description"
 ```
 
+A database created by `domain-monitor init` (or any command — `create_all()` runs on
+every startup) is stamped at Alembic's current head automatically the moment it's built,
+so `alembic upgrade head` against it is always a no-op until the next real migration
+ships. This only fires for a database that was genuinely empty; one that already has
+tables is left alone rather than guessed at.
+
+**If you're upgrading a database that predates this** (any `domain-monitor` deployment
+running code from before this note existed), that automatic stamp never happened, and
+`alembic upgrade head` will fail with something like `relation "domains" already exists`
+— Alembic has no record of your database's history and tries to replay every migration
+from scratch. Fix it once, by telling Alembic which revision your schema already matches,
+then let it apply only what's actually new:
+
+```bash
+alembic history                        # lists every revision in order
+alembic stamp <the revision just before the one you actually need>
+alembic upgrade head
+```
+
+Concretely, if your `rule_matches` table already has a `method` column (check with `\d
+rule_matches` in `psql`, or `.schema rule_matches` in `sqlite3`) but `runs` does not yet
+have `pid`, run `alembic stamp c08363c47666` before `alembic upgrade head`.
+
 ## Licence
 
 Apache 2.0.
