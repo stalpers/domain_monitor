@@ -18,7 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -208,11 +208,21 @@ def stage_zone(
     timeout: float = 30.0,
     lifetime: float = 3600.0,
     names: Iterable[str] | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> TransferResult:
     """Acquire one TLD's zone into the staging table.
 
     ``names`` overrides acquisition entirely and is used by tests. Returns counts rather
     than the names themselves -- the caller must not need them all in memory.
+
+    ``on_progress``, if given, is called with the cumulative offered count after every
+    batch flush. This is the only visibility into a transfer in progress: the actual
+    ``zone_staging`` rows sit in this uncommitted transaction and are invisible to any
+    other connection until the run finishes, so a slow or genuinely stuck transfer would
+    otherwise look identical from ``domain-monitor status``. The callback is expected to
+    write that number out through a separate, independently-committed connection (see
+    ``service._heartbeat``); a failure in it must never abort the transfer, so callers
+    should swallow their own errors rather than let this raise.
     """
     started = time.monotonic()
     complete = True
@@ -250,6 +260,8 @@ def stage_zone(
                 batch.clear()
                 seen_in_batch.clear()
                 logger.debug(".%s: staged %d names", source.tld, offered)
+                if on_progress is not None:
+                    on_progress(offered)
     except ZoneError:
         raise
     except Exception as exc:

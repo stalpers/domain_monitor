@@ -22,9 +22,13 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
+import sys
 from dataclasses import dataclass, field
 
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from . import availability  # noqa: F401  (interface only; Phase 4 hook)
 from .alerts import AlertError, console_alert, send_email, send_failure_email
@@ -43,6 +47,125 @@ from .zones import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+#: A RUNNING row with no ``pid`` predates this feature (or came from a platform where
+#: liveness can't be checked). It gets a time-based grace period instead of an exact
+#: check -- generous enough that no real transfer should hit it, since ``lifetime`` on
+#: an AXFR alone defaults to an hour.
+STALE_RUN_GRACE_HOURS = 6
+
+
+def pid_alive(pid: int) -> bool:
+    """Best-effort: is this process still running?
+
+    POSIX only. ``os.kill(pid, 0)`` sends no signal, it just asks the kernel whether the
+    pid exists and is ours to signal. On a platform where that check isn't meaningful
+    (Windows), assume alive: a false "still running" costs a stale status line, while a
+    false "dead" would incorrectly fail a run that is actually still in progress.
+    """
+    if sys.platform == "win32":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but not ours to signal (EPERM), or an ambiguous error
+    return True
+
+
+def reap_stale_runs(session: Session) -> list[Run]:
+    """Fail any RUNNING row whose owning process is provably gone.
+
+    The on-disk lock (``locking.process_lock``) is released by the OS the instant its
+    owning process dies, even via SIGKILL or an OOM kill -- so a crashed run never blocks
+    the *next* invocation from acquiring the lock and starting. But nothing else ever
+    revisits the crashed run's own ``Run`` row, so without this it sits at RUNNING in
+    ``domain-monitor status`` forever: indistinguishable from genuine, current progress.
+
+    Called at the start of every run (so a crash is cleaned up automatically on the next
+    attempt) and by ``domain-monitor status`` (so it's visible without waiting for one).
+    """
+    running = list(
+        session.execute(select(Run).where(Run.status == Run.STATUS_RUNNING)).scalars()
+    )
+    reaped: list[Run] = []
+    now = utcnow()
+    for run in running:
+        if run.pid is not None:
+            if pid_alive(run.pid):
+                continue
+            reason = f"process {run.pid} is no longer running"
+        else:
+            started = run.started_at
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=dt.timezone.utc)
+            age_hours = (now - started).total_seconds() / 3600.0
+            if age_hours < STALE_RUN_GRACE_HOURS:
+                continue  # no pid recorded (pre-dates this feature); not old enough yet
+            reason = f"no heartbeat and started {age_hours:.1f}h ago"
+
+        run.status = Run.STATUS_FAILED
+        run.finished_at = now
+        run.error_message = f"orphaned: {reason} (the run crashed or was killed)"
+        logger.warning("Run %d: marked FAILED -- %s", run.id, reason)
+        reaped.append(run)
+
+    if reaped:
+        session.commit()
+    return reaped
+
+
+def _heartbeat(
+    session_factory: sessionmaker[Session],
+    run_id: int,
+    *,
+    phase: str | None = None,
+    pid: int | None = None,
+    staged: int | None = None,
+) -> None:
+    """Report progress on a run that is still going, through its own throwaway connection.
+
+    Deliberately not the run's own session: staging plus diffing is one all-or-nothing
+    transaction by design (see the module docstring), so writing progress through it
+    would mean either committing early -- breaking that guarantee -- or writing into a
+    transaction nobody else can see until it is already over, which defeats the point of
+    a heartbeat. So this opens a second, independent connection instead, so a fresh
+    ``domain-monitor status`` sees it immediately.
+
+    Two things make that connection deliberately disposable rather than one borrowed
+    from the normal pool:
+
+    1. On SQLite, the main transaction can hold the one write lock for the entire run.
+       ``timeout=0`` here means a blocked write fails instantly instead of sitting in
+       SQLite's default multi-second busy-retry -- a dropped heartbeat is fine, five
+       real seconds of it blocking the run five times over is not.
+    2. That override must not leak into a *pooled* connection that gets handed to
+       something else afterwards expecting the engine's normal timeout. ``NullPool``
+       guarantees this connection is closed for good when the block below exits, never
+       reused.
+
+    Must never be allowed to fail the run it is reporting on.
+    """
+    try:
+        bind = session_factory().get_bind()
+        connect_args = {"timeout": 0} if bind.dialect.name == "sqlite" else {}
+        hb_engine = create_engine(bind.url, poolclass=NullPool, connect_args=connect_args)
+        try:
+            values: dict[str, object] = {"heartbeat_at": utcnow()}
+            if phase is not None:
+                values["phase"] = phase
+            if pid is not None:
+                values["pid"] = pid
+            if staged is not None:
+                values["staged_hint"] = staged
+            with hb_engine.begin() as conn:
+                conn.execute(Run.__table__.update().where(Run.id == run_id).values(**values))
+        finally:
+            hb_engine.dispose()
+    except Exception:  # noqa: BLE001 - a missed heartbeat must never fail the run
+        logger.debug("Run %d: heartbeat update failed, continuing", run_id, exc_info=True)
 
 
 @dataclass(slots=True)
@@ -73,10 +196,12 @@ def run_once(
     """
     target_tlds = tlds or cfg.tlds
     session = session_factory()
+    reap_stale_runs(session)
     run = Run(started_at=utcnow(), status=Run.STATUS_RUNNING)
     session.add(run)
     session.commit()                      # the Run row exists even if everything fails
     report = RunReport(run_id=run.id, status=Run.STATUS_RUNNING)
+    _heartbeat(session_factory, run.id, phase="STARTING", pid=os.getpid())
 
     try:
         # --- 1. acquire ---------------------------------------------------------
@@ -102,9 +227,16 @@ def run_once(
                 continue
 
             injected = zone_names.get(tld) if zone_names else None
-            result = stage_zone(session, run.id, source, names=injected)
+            _heartbeat(session_factory, run.id, phase=f"ACQUIRING .{tld}")
+            result = stage_zone(
+                session, run.id, source, names=injected,
+                on_progress=lambda n, tld=tld: _heartbeat(
+                    session_factory, run.id, phase=f"ACQUIRING .{tld}", staged=n
+                ),
+            )
 
             # --- 2. validate ----------------------------------------------------
+            _heartbeat(session_factory, run.id, phase=f"VALIDATING .{tld}")
             validate_transfer(session, result, min_ratio=cfg.min_zone_ratio)
             results.append(result)
             counts_by_tld[tld] = result.name_count
@@ -121,9 +253,11 @@ def run_once(
         transferred_tlds = [r.tld for r in results]
 
         # --- 3. diff, persist, evaluate ----------------------------------------
+        _heartbeat(session_factory, run.id, phase="DIFFING")
         counts = apply_diff(session, run.id, transferred_tlds)
         report.counts = counts
 
+        _heartbeat(session_factory, run.id, phase="EVALUATING RULES")
         matches: list[Match] = []
         if not counts.baseline:
             models = _load_models(session, transferred_tlds)
@@ -195,10 +329,12 @@ def run_backfill(
 ) -> RunReport:
     """Evaluate rules against the domains currently in the zone."""
     session = session_factory()
+    reap_stale_runs(session)
     run = Run(started_at=utcnow(), status=Run.STATUS_RUNNING)
     session.add(run)
     session.commit()
     report = RunReport(run_id=run.id, status=Run.STATUS_RUNNING)
+    _heartbeat(session_factory, run.id, phase="BACKFILLING", pid=os.getpid())
 
     try:
         models = _load_models(session, cfg.tlds)

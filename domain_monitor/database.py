@@ -29,6 +29,11 @@ def create_db_engine(database_url: str, echo: bool = False) -> Engine:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA foreign_keys=ON")
+            # SQLite allows only one writer at a time; without this, a second
+            # connection (e.g. the run's heartbeat write, or `domain-monitor status`)
+            # fails immediately with "database is locked" instead of waiting briefly
+            # for the long-running transfer transaction to free the write lock.
+            cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
 
     return engine

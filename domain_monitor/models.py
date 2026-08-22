@@ -133,6 +133,24 @@ class Run(Base):
     matched_count: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    #: Progress reporting for a run that is still RUNNING, written through a *separate*
+    #: short transaction (see ``service._heartbeat``) rather than the run's own long one --
+    #: staging plus diffing is all-or-nothing by design (see the module docstring in
+    #: service.py), so these columns cannot be updated on the same connection without
+    #: either committing early (defeating that guarantee) or being invisible to anyone
+    #: else until the whole run finishes (defeating the point of a heartbeat). ``pid`` and
+    #: ``phase`` let ``domain-monitor status`` distinguish "still working" from "the
+    #: process died without anyone noticing" while a run sits at RUNNING.
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    phase: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    heartbeat_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: Best-effort count of names staged so far, for the phase where there is otherwise
+    #: no visible progress at all -- the actual zone_staging rows are uncommitted and
+    #: invisible to any other connection until the run either succeeds or fails.
+    staged_hint: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     events: Mapped[list[DomainEvent]] = relationship(back_populates="run")
     alerts: Mapped[list[Alert]] = relationship(back_populates="run")
 

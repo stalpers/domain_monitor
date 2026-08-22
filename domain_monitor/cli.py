@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import logging
 import sys
@@ -14,7 +15,7 @@ from .config import Config, ConfigError, TypoRule, load_config
 from .database import create_all, create_db_engine, make_session_factory
 from .locking import AlreadyRunning, process_lock
 from .models import Run
-from .service import recent_runs, run_backfill, run_once
+from .service import pid_alive, reap_stale_runs, recent_runs, run_backfill, run_once
 
 logger = logging.getLogger("domain_monitor")
 
@@ -281,6 +282,46 @@ def cmd_rules(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_age(seconds: float) -> str:
+    """Render a duration the way a human skims a status line, not a stopwatch."""
+    if seconds < 0:
+        seconds = 0
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{minutes:.0f}m"
+    return f"{minutes / 60:.1f}h"
+
+
+def _running_detail_line(run: Run, now: dt.datetime) -> str:
+    """One extra line for a RUNNING row: phase, progress, and whether its process is
+    actually still alive -- the difference between "still working" and "crashed, and
+    nobody has told the database yet" is invisible without this."""
+    bits = []
+    if run.phase:
+        bits.append(run.phase)
+    if run.staged_hint is not None:
+        bits.append(f"staged {run.staged_hint:,}")
+
+    if run.pid is not None:
+        alive = pid_alive(run.pid)
+        bits.append(f"pid {run.pid} ({'alive' if alive else 'NOT RUNNING'})")
+    else:
+        bits.append("pid unknown (predates progress tracking)")
+
+    if run.heartbeat_at is not None:
+        heartbeat = run.heartbeat_at
+        if heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=dt.timezone.utc)
+        age = (now - heartbeat).total_seconds()
+        bits.append(f"heartbeat {_format_age(age)} ago")
+    else:
+        bits.append("no heartbeat yet")
+
+    return "        " + "  ".join(bits)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from sqlalchemy import func, select
 
@@ -288,6 +329,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     cfg, session_factory = _prepare(args)
     with session_factory() as session:
+        # A run whose process is provably dead is fixed up right here, so a RUNNING row
+        # never has to be taken on faith -- if it's still showing RUNNING after this,
+        # its pid really is alive (or it predates pid tracking and isn't old enough yet
+        # to call, see reap_stale_runs).
+        reaped = reap_stale_runs(session)
+        for run in reaped:
+            print(f"Note: run #{run.id} was stuck at RUNNING; {run.error_message}\n")
+
         domains = session.execute(select(func.count()).select_from(Domain)).scalar_one()
         in_zone = session.execute(
             select(func.count()).select_from(Domain).where(Domain.currently_in_zone.is_(True))
@@ -312,6 +361,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
         runs = recent_runs(session, args.limit)
         if runs:
+            now = dt.datetime.now(dt.timezone.utc)
             print("\nRecent runs:")
             for run in runs:
                 counts = json.loads(run.zone_counts or "{}")
@@ -322,6 +372,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                     f"match={run.matched_count}  {zones}"
                     + (f"  {run.error_message}" if run.error_message else "")
                 )
+                if run.status == Run.STATUS_RUNNING:
+                    print(_running_detail_line(run, now))
     return 0
 
 

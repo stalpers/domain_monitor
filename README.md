@@ -197,6 +197,41 @@ just re-transfer a zone the running instance is already transferring.
 Runs on Windows as well as POSIX — the lock uses `msvcrt.locking` there instead of
 `fcntl.flock`, same non-blocking-acquire contract either way (`domain_monitor/locking.py`).
 
+### Watching a run in progress, and telling "still working" from "crashed"
+
+A transfer plus diff can run long enough that `domain-monitor status`, checked from
+another shell, is the only window into it. For a RUNNING row it prints the current phase,
+names staged so far, the pid that owns it, and how long ago it last reported in:
+
+```
+Recent runs:
+  #5     RUNNING  2026-08-22 16:40  +0 -0 ~0 match=0
+        ACQUIRING .ch  staged 1,230,000  pid 8421 (alive)  heartbeat 4s ago
+```
+
+That pid check is what turns "RUNNING" from a guess into an answer. The file lock
+(`LOCK_PATH`) is released by the OS the instant its owning process dies, even via `kill
+-9` or an OOM kill — so a crash never blocks the next `domain-monitor run` from starting.
+But nothing else ever revisits the crashed run's own row, so without this it would sit at
+RUNNING forever, indistinguishable from real progress. `status` checks whether the
+recorded pid is actually alive and, on every `run`/`rules --backfill` invocation and every
+`status` call, automatically fails any RUNNING row whose process is provably gone:
+
+```
+Note: run #4 was stuck at RUNNING; orphaned: process 1025753 is no longer running (the run crashed or was killed)
+```
+
+A RUNNING row from before this existed (no pid recorded) gets a six-hour grace period
+instead of an exact check, rather than being failed outright on the next status call.
+
+The heartbeat itself writes through a short-lived, disposable connection, deliberately
+separate from the run's own long transaction — staging plus diffing is one all-or-nothing
+commit by design (see below), so progress can't be written through that same transaction
+without either committing early or being invisible to everyone else until it's already
+over. On SQLite this connection also overrides the busy-wait down to zero: a heartbeat
+that can't get the (single) write lock right now is meant to be dropped and retried a
+moment later, not to block the run behind it.
+
 ## Safety: a failed transfer is not a mass deletion
 
 This is the property the system exists to guarantee. `.ch` is ~2.6M names; reading a broken
@@ -318,6 +353,9 @@ Three files to read first, for the properties this project is actually built aro
 - `tests/test_typosquat.py::TestFalsePositiveCorpus` — the precision regression suite.
   A curated brand list checked against ~50 plausible benign Swiss domain names, zero
   matches required.
+- `tests/test_run_progress.py` — heartbeats, `reap_stale_runs`, and the pid-liveness
+  check `domain-monitor status` uses to tell a run that's still working apart from one
+  whose process died without anyone updating the row.
 
 Migrations:
 
